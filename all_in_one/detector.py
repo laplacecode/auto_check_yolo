@@ -321,6 +321,12 @@ class DetectorClient(QWidget):
         self.setWindowTitle("YOLOv5 实时检测 - All-in-One 版本")
         self.resize(900, 800)
 
+        # 设置窗口位置：x 居中，y = 10
+        screen = QApplication.primaryScreen().geometry()
+        window_x = (screen.width() - 900) // 2
+        window_y = 10
+        self.move(window_x, window_y)
+
     # ========== 辅助方法 ==========
 
     def apply_preset(self, index):
@@ -439,11 +445,11 @@ class DetectorClient(QWidget):
             while self.running:
                 frame_count += 1
 
-                # 捕获屏幕
+                # 捕获屏幕 - 使用 numpy 数组切片而不是 cv2.cvtColor（避免线程安全问题）
                 current_region = self.get_capture_region()
                 img = np.array(sct.grab(current_region))
-                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # 直接通过数组切片转换 BGRA -> RGB（避免 cv2 线程问题）
+                rgb = img[:, :, [2, 1, 0]]  # BGR to RGB
 
                 # 保存当前帧（供 UI 线程使用）
                 with self.lock:

@@ -43,6 +43,19 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "../models/yolov5s.pt")
 _model = None
 _model_lock = threading.Lock()
 
+# COCO 数据集类别名称（80个类别）
+COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+    'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
+    'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+    'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
+
 
 def load_model():
     """
@@ -143,12 +156,16 @@ def run_detection(frame_array):
             # 提取每个检测框的信息
             for row in arr:
                 x1, y1, x2, y2, conf, cls = row
+                cls_id = int(cls)
+                # 获取类别名称，如果超出范围则使用 ID
+                cls_name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class_{cls_id}"
                 detections.append({
                     "x": int(x1),
                     "y": int(y1),
                     "w": int(x2 - x1),
                     "h": int(y2 - y1),
-                    "cls": str(int(cls)),
+                    "cls": cls_name,
+                    "cls_id": cls_id,
                     "conf": float(conf),
                 })
 

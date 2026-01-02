@@ -7,6 +7,8 @@ YOLOv5 实时检测前端客户端
 实时参数调整和可视化红框提示
 """
 import base64
+import json
+import socket
 import sys
 import threading
 import time
@@ -22,6 +24,17 @@ from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QGroupBox,
                              QHBoxLayout, QLabel, QPushButton, QSpinBox,
                              QVBoxLayout, QWidget)
+
+# 创建一个持久的 requests session（连接池复用，避免每次请求重新建立 TCP 连接）
+detection_session = requests.Session()
+detection_session.headers.update({'Connection': 'keep-alive'})
+# 设置连接池大小和重试策略
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=1,
+    pool_maxsize=1,
+    max_retries=0
+)
+detection_session.mount('http://', adapter)
 
 
 # ==================== 区域叠加层（红框提示） ====================
@@ -225,6 +238,7 @@ class VideoClient(QWidget):
         self.detections = []
         self.last_detection_time = 0
         self.lock = threading.Lock()
+        self.detection_in_progress = False  # 标记是否有检测正在进行
 
         # 创建叠加层窗口
         self.overlay = RegionOverlay()
@@ -242,6 +256,12 @@ class VideoClient(QWidget):
 
         self.setWindowTitle("YOLOv5 实时检测 - 屏幕捕获")
         self.resize(900, 800)
+
+        # 设置窗口位置：x 居中，y = 10
+        screen = QApplication.desktop().screenGeometry()
+        window_x = (screen.width() - 900) // 2
+        window_y = 10
+        self.move(window_x, window_y)
 
     # ========== 辅助方法 ==========
 
@@ -318,6 +338,79 @@ class VideoClient(QWidget):
 
     # ========== 主要功能 ==========
 
+    def async_detection(self, rgb, frame_count):
+        """
+        异步检测方法（在后台线程中运行）- 使用 UDP 协议
+
+        Args:
+            rgb: RGB 图像数组
+            frame_count: 当前帧数
+        """
+        udp_host = "127.0.0.1"
+        udp_port = 8003
+
+        try:
+            # 将图像编码为 JPEG base64（极低质量和分辨率以提升速度）
+            h_img, w_img = rgb.shape[:2]
+            scale_factor = 1.0
+
+            # 更激进的缩放 - 限制在 480px
+            if w_img > 480:
+                scale_factor = w_img / 480
+                new_w, new_h = 480, int(h_img / scale_factor)
+                pil_img = Image.fromarray(rgb).resize((new_w, new_h), Image.BILINEAR)
+            else:
+                pil_img = Image.fromarray(rgb)
+
+            buffer = BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=35)  # 极低质量 35
+            img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+            # 创建 UDP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)  # 500ms 超时
+
+            # 发送检测请求
+            request_data = json.dumps({"image": img_b64}).encode('utf-8')
+
+            # 检查数据大小（UDP 限制 64KB）
+            if len(request_data) < 65000:
+                sock.sendto(request_data, (udp_host, udp_port))
+
+                # 接收响应
+                response_data, _ = sock.recvfrom(65536)
+                result = json.loads(response_data.decode('utf-8'))
+
+                detections = result.get("detections", [])
+
+                # 如果图像被缩放，需要将检测框坐标放大回原始尺寸
+                if scale_factor > 1.0:
+                    for det in detections:
+                        det['x'] = int(det['x'] * scale_factor)
+                        det['y'] = int(det['y'] * scale_factor)
+                        det['w'] = int(det['w'] * scale_factor)
+                        det['h'] = int(det['h'] * scale_factor)
+
+                with self.lock:
+                    self.detections = detections
+                    self.last_detection_time = time.time()
+
+                det_count = len(self.detections)
+                if det_count > 0:
+                    print(f"帧 {frame_count}: 检测到 {det_count} 个对象 (UDP)")
+            else:
+                print(f"警告: 图像数据过大 ({len(request_data)} bytes)，跳过检测")
+
+            sock.close()
+
+        except socket.timeout:
+            print("UDP 检测请求超时")
+        except Exception as e:
+            print(f"UDP 检测请求失败: {e}")
+        finally:
+            # 释放检测锁，允许下次检测
+            self.detection_in_progress = False
+
     def toggle(self):
         """切换检测状态"""
         self.running = not self.running
@@ -362,6 +455,9 @@ class VideoClient(QWidget):
         self.status_label.setText("状态: 正在运行检测...")
         print(f"开始检测循环，后端地址: {detect_url}")
 
+        # 为此线程创建独立的 mss 实例（线程安全）
+        sct = mss.mss()
+
         try:
             while self.running:
                 frame_count += 1
@@ -372,43 +468,20 @@ class VideoClient(QWidget):
                 # 实时更新叠加层区域
                 self.update_overlay_region()
 
-                # 捕获屏幕
-                img = np.array(self.sct.grab(current_region))
-                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # 捕获屏幕 - 使用 numpy 数组切片而不是 cv2.cvtColor（避免线程安全问题）
+                img = np.array(sct.grab(current_region))
+                # 直接通过数组切片转换 BGRA -> RGB（避免 cv2 线程问题）
+                rgb = img[:, :, [2, 1, 0]]  # BGR to RGB
 
-                # 每 5 帧发送一次图像到后端进行检测（降低负载）
-                if frame_count % 5 == 0:
-                    try:
-                        # 将图像编码为 JPEG base64
-                        pil_img = Image.fromarray(rgb)
-                        buffer = BytesIO()
-                        pil_img.save(buffer, format="JPEG", quality=85)
-                        img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-                        # 发送到后端检测
-                        resp = requests.post(
-                            detect_url,
-                            json={"image": img_b64},
-                            timeout=2
-                        )
-
-                        if resp.status_code == 200:
-                            result = resp.json()
-                            with self.lock:
-                                self.detections = result.get("detections", [])
-                                self.last_detection_time = time.time()
-
-                            det_count = len(self.detections)
-                            if det_count > 0:
-                                print(f"帧 {frame_count}: 检测到 {det_count} 个对象")
-                        else:
-                            print(f"检测请求失败: HTTP {resp.status_code}")
-
-                    except requests.exceptions.Timeout:
-                        print("检测请求超时")
-                    except Exception as e:
-                        print(f"检测请求失败: {e}")
+                # 异步发送检测请求（非阻塞）- 每 15 帧检测一次，且仅在上次检测完成后才发送新请求
+                if frame_count % 15 == 0 and not self.detection_in_progress:
+                    self.detection_in_progress = True
+                    # 在后台线程中发送检测请求，避免阻塞主循环
+                    threading.Thread(
+                        target=self.async_detection,
+                        args=(rgb.copy(), frame_count),
+                        daemon=True
+                    ).start()
 
                 # 绘制检测框（使用锁获取一致的快照）
                 detection_count = 0
@@ -421,6 +494,9 @@ class VideoClient(QWidget):
                     detection_count = len(self.detections)
                     detections_snapshot = self.detections.copy()
 
+                # 创建一个副本用于绘制（避免修改原始数据）
+                display_frame = rgb.copy()
+
                 # 绘制所有检测框
                 for d in detections_snapshot:
                     x, y, wbox, hbox = d.get('x', 0), d.get('y', 0), d.get('w', 0), d.get('h', 0)
@@ -428,26 +504,26 @@ class VideoClient(QWidget):
                     cls = d.get('cls', '?')
 
                     # 绘制边框
-                    cv2.rectangle(rgb, (x, y), (x + wbox, y + hbox), (0, 255, 0), 3)
+                    cv2.rectangle(display_frame, (x, y), (x + wbox, y + hbox), (0, 255, 0), 3)
 
-                    # 绘制标签背景
-                    label = f"类别 {cls}: {conf:.2f}"
+                    # 绘制标签背景（纯英文，避免中文乱码）
+                    label = f"{cls}: {conf:.2f}"
                     (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(rgb, (x, y - label_h - 10), (x + label_w, y), (0, 255, 0), -1)
-                    cv2.putText(rgb, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                    cv2.rectangle(display_frame, (x, y - label_h - 10), (x + label_w, y), (0, 255, 0), -1)
+                    cv2.putText(display_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
                 # 更新检测数量标签
                 self.detection_label.setText(f"检测数: {detection_count}")
 
                 # 转换为 QImage 并显示
-                h, w, ch = rgb.shape
+                h, w, ch = display_frame.shape
                 bytes_per_line = ch * w
-                qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                qimg = QImage(display_frame.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
                 pix = QPixmap.fromImage(qimg).scaled(800, 1000, Qt.KeepAspectRatio)
                 self.label.setPixmap(pix)
                 QApplication.processEvents()
 
-                time.sleep(1 / 15)
+                time.sleep(1 / 30)  # 提升到 30 FPS
 
         except Exception as e:
             print(f"检测循环错误: {e}")
